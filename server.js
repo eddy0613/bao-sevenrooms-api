@@ -131,7 +131,6 @@ async function bookViaWidget(venue, date, time, partySize, guest) {
     // Wait for any clickable time slot element to appear
     await page.waitForFunction(
       () => {
-        // Look for buttons/links containing time patterns like "2:00 PM" or "14:00"
         const allButtons = document.querySelectorAll("button, a, [role='button'], div[class*='time'], div[class*='slot']");
         return allButtons.length > 5;
       },
@@ -139,6 +138,20 @@ async function bookViaWidget(venue, date, time, partySize, guest) {
     );
 
     await new Promise((r) => setTimeout(r, 1000));
+
+    // Click "All times" or "See all" button if present to show all available slots
+    await page.evaluate(() => {
+      const allEls = document.querySelectorAll("button, a, [role='button'], div[tabindex]");
+      for (const el of allEls) {
+        const text = el.textContent.trim().toLowerCase();
+        if (text.includes("all times") || text.includes("see all") || text.includes("show all") || text.includes("view all")) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    await new Promise((r) => setTimeout(r, 1500));
 
     // Find and click the time slot button matching our time
     const slotClicked = await page.evaluate((targetTime) => {
@@ -155,13 +168,14 @@ async function bookViaWidget(venue, date, time, partySize, guest) {
 
       for (const el of candidates) {
         const text = el.textContent.trim().toLowerCase();
-        if (text.length > 0 && text.length < 30) debugTexts.push(text);
+        if (text.length > 0 && text.length < 50) debugTexts.push(text);
 
+        // Match "18:00" at start of text like "18:00counter seating" or "18:00 Counter Seating"
         if (
+          text.startsWith(targetTime.toLowerCase()) ||
           text.includes(displayTimeLower) ||
           text.includes(displayTime12.toLowerCase().replace(" ", "")) ||
-          text === targetTime ||
-          text.includes(targetTime)
+          text === targetTime
         ) {
           el.click();
           return { found: true, clicked: el.textContent.trim() };
