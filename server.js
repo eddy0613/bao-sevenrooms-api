@@ -234,49 +234,52 @@ app.post("/book", auth, async (req, res) => {
   }
 
   try {
-    // Step 1: Get availability to find the slot IDs
-    const availParams = new URLSearchParams({
-      venue: venue.url_key,
-      party_size: String(party_size),
-      halo_size_interval: "16",
-      start_date: date,
-      num_days: "1",
-      channel: "SEVENROOMS_WIDGET",
-      time_slot: time,
-    });
+    // Use provided IDs if available, otherwise fetch from SevenRooms
+    let accessPersistentId = req.body.access_persistent_id;
+    let shiftPersistentId = req.body.shift_persistent_id;
 
-    const availUrl = `https://www.sevenrooms.com/api-yoa/availability/widget/range?${availParams}`;
-    const availRes = await fetch(availUrl, {
-      headers: { Accept: "application/json" },
-      timeout: 5000,
-    });
-    const availData = await availRes.json();
+    if (!accessPersistentId || !shiftPersistentId) {
+      // Step 1: Get availability to find the slot IDs
+      const availParams = new URLSearchParams({
+        venue: venue.url_key,
+        party_size: String(party_size),
+        halo_size_interval: "16",
+        start_date: date,
+        num_days: "1",
+        channel: "SEVENROOMS_WIDGET",
+        time_slot: time,
+      });
 
-    if (availData.status !== 200 || !availData.data) {
-      return res
-        .status(502)
-        .json({ error: "Could not verify availability", detail: availData.msg });
-    }
+      const availUrl = `https://www.sevenrooms.com/api-yoa/availability/widget/range?${availParams}`;
+      const availRes = await fetch(availUrl, {
+        headers: { Accept: "application/json" },
+        timeout: 5000,
+      });
+      const availData = await availRes.json();
 
-    // Find the matching time slot
-    const dayData = availData.data.availability?.[date] || [];
-    let matchingSlot = null;
-    for (const shift of dayData) {
-      if (shift.is_closed) continue;
-      for (const slot of shift.times || []) {
-        if (slot.time === time && slot.type === "book") {
-          matchingSlot = slot;
-          break;
-        }
+      if (availData.status !== 200 || !availData.data) {
+        return res
+          .status(502)
+          .json({ error: "Could not verify availability", detail: availData.msg });
       }
-      if (matchingSlot) break;
-    }
 
-    // Use provided IDs or found slot IDs
-    const accessPersistentId =
-      req.body.access_persistent_id || matchingSlot?.access_persistent_id;
-    const shiftPersistentId =
-      req.body.shift_persistent_id || matchingSlot?.shift_persistent_id;
+      // Find the matching time slot
+      const dayData = availData.data.availability?.[date] || [];
+      let matchingSlot = null;
+      for (const shift of dayData) {
+        if (shift.is_closed) continue;
+        for (const slot of shift.times || []) {
+          if (slot.time === time && slot.type === "book") {
+            matchingSlot = slot;
+            break;
+          }
+        }
+        if (matchingSlot) break;
+      }
+
+      accessPersistentId = matchingSlot?.access_persistent_id;
+      shiftPersistentId = matchingSlot?.shift_persistent_id;
+    }
 
     if (!accessPersistentId || !shiftPersistentId) {
       return res
