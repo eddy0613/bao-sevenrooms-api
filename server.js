@@ -139,12 +139,45 @@ async function bookViaWidget(venue, date, time, partySize, guest) {
 
     await new Promise((r) => setTimeout(r, 1000));
 
-    // Click "All times" or "See all" button if present to show all available slots
+    // Click the correct shift/meal period tab and "All times" to reveal all slots
+    const hour = parseInt(time.split(":")[0]);
+    await page.evaluate((targetHour) => {
+      const allEls = document.querySelectorAll("button, a, [role='button'], div[tabindex], span[tabindex]");
+
+      // First try to click "All times" or "See all"
+      for (const el of allEls) {
+        const text = el.textContent.trim().toLowerCase();
+        if (text.includes("all times") || text.includes("see all") || text.includes("show all") || text.includes("view all")) {
+          el.click();
+          return "clicked_all_times";
+        }
+      }
+
+      // Try to click the right shift tab (Lunch, All Day, Brunch, Dinner)
+      const lunchKeywords = ["lunch", "all day", "brunch", "midday", "afternoon"];
+      const dinnerKeywords = ["dinner", "evening", "supper"];
+      const targetKeywords = targetHour < 17 ? lunchKeywords : dinnerKeywords;
+
+      for (const el of allEls) {
+        const text = el.textContent.trim().toLowerCase();
+        for (const kw of targetKeywords) {
+          if (text.includes(kw) && text.length < 30) {
+            el.click();
+            return "clicked_shift_" + text;
+          }
+        }
+      }
+
+      return "no_tab_found";
+    }, hour);
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // After clicking a shift tab, try "All times" again
     await page.evaluate(() => {
       const allEls = document.querySelectorAll("button, a, [role='button'], div[tabindex]");
       for (const el of allEls) {
         const text = el.textContent.trim().toLowerCase();
-        if (text.includes("all times") || text.includes("see all") || text.includes("show all") || text.includes("view all")) {
+        if (text.includes("all times") || text.includes("see all") || text.includes("show all")) {
           el.click();
           return true;
         }
