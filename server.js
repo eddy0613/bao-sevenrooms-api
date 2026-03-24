@@ -125,38 +125,69 @@ async function bookViaWidget(venue, date, time, partySize, guest) {
     console.log(`[book] Navigating to: ${searchUrl}`);
     await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 20000 });
 
-    // Step 2: Wait for time slots to load and click the matching one
-    await page.waitForSelector('[data-test="time-slot"]', { timeout: 10000 });
+    // Step 2: Wait for the page to fully load (SPA)
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // Wait for any clickable time slot element to appear
+    await page.waitForFunction(
+      () => {
+        // Look for buttons/links containing time patterns like "2:00 PM" or "14:00"
+        const allButtons = document.querySelectorAll("button, a, [role='button'], div[class*='time'], div[class*='slot']");
+        return allButtons.length > 5;
+      },
+      { timeout: 12000 }
+    );
+
+    await new Promise((r) => setTimeout(r, 1000));
 
     // Find and click the time slot button matching our time
     const slotClicked = await page.evaluate((targetTime) => {
-      const slots = document.querySelectorAll('[data-test="time-slot"]');
-      for (const slot of slots) {
-        const text = slot.textContent.trim();
-        // Convert 24h time to match widget format (e.g., "14:00" -> "2:00 PM")
-        const [h, m] = targetTime.split(":");
-        const hour = parseInt(h);
-        const ampm = hour >= 12 ? "PM" : "AM";
-        const displayHour = hour > 12 ? hour - 12 : hour === 0 ? 12 : hour;
-        const displayTime = `${displayHour}:${m} ${ampm}`;
+      const [h, m] = targetTime.split(":");
+      const hour = parseInt(h);
+      const ampm = hour >= 12 ? "PM" : "AM";
+      const displayHour = hour > 12 ? hour - 12 : hour === 0 ? 12 : hour;
+      const displayTime12 = `${displayHour}:${m} ${ampm}`;
+      const displayTimeLower = displayTime12.toLowerCase();
 
-        if (text.includes(displayTime) || text.includes(targetTime)) {
-          slot.click();
-          return { found: true, clicked: text };
+      // Search through all interactive elements
+      const candidates = document.querySelectorAll("button, a, [role='button'], div[tabindex], span[tabindex]");
+      const debugTexts = [];
+
+      for (const el of candidates) {
+        const text = el.textContent.trim().toLowerCase();
+        if (text.length > 0 && text.length < 30) debugTexts.push(text);
+
+        if (
+          text.includes(displayTimeLower) ||
+          text.includes(displayTime12.toLowerCase().replace(" ", "")) ||
+          text === targetTime ||
+          text.includes(targetTime)
+        ) {
+          el.click();
+          return { found: true, clicked: el.textContent.trim() };
         }
       }
-      // Try clicking any slot that contains the time
-      for (const slot of slots) {
-        if (slot.textContent.includes(targetTime.replace(/^0/, ""))) {
-          slot.click();
-          return { found: true, clicked: slot.textContent.trim() };
+
+      // Also try all elements containing the time
+      const allEls = document.querySelectorAll("*");
+      for (const el of allEls) {
+        if (el.children.length > 0) continue; // Only leaf nodes
+        const text = el.textContent.trim().toLowerCase();
+        if (
+          (text.includes(displayTimeLower) || text.includes(targetTime)) &&
+          text.length < 30
+        ) {
+          // Click the closest clickable parent
+          const clickable = el.closest("button, a, [role='button'], div[tabindex]") || el;
+          clickable.click();
+          return { found: true, clicked: el.textContent.trim() };
         }
       }
+
       return {
         found: false,
-        available: Array.from(slots)
-          .map((s) => s.textContent.trim())
-          .slice(0, 10),
+        available: debugTexts.filter((t) => /\d{1,2}[:\s]?\d{2}/.test(t)).slice(0, 15),
+        allDebug: debugTexts.slice(0, 20),
       };
     }, time);
 
@@ -171,9 +202,11 @@ async function bookViaWidget(venue, date, time, partySize, guest) {
     console.log(`[book] Clicked slot: ${slotClicked.clicked}`);
 
     // Step 3: Wait for the guest details form to appear
-    await page.waitForSelector('input[data-test="first_name"], input[name="first_name"], input[placeholder*="First"]', {
-      timeout: 10000,
-    });
+    await new Promise((r) => setTimeout(r, 2000));
+    await page.waitForFunction(
+      () => document.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"]').length >= 2,
+      { timeout: 12000 }
+    );
     await new Promise((r) => setTimeout(r, 500));
 
     // Step 4: Fill in guest details
