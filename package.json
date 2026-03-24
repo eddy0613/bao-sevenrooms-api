@@ -1,13 +1,17 @@
 {
   "name": "bao-sevenrooms-api",
-  "version": "1.0.0",
-  "description": "SevenRooms booking API proxy for BAO restaurants",
+  "version": "2.0.0",
+  "description": "SevenRooms booking API proxy for BAO restaurants (with Puppeteer)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "puppeteer": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

@@ -1,5 +1,6 @@
 const express = require("express");
 const fetch = require("node-fetch");
+const puppeteer = require("puppeteer");
 
 const app = express();
 app.use(express.json());
@@ -60,7 +61,6 @@ const VENUES = {
   },
 };
 
-// Also accept the variant attribute venue_ids as aliases
 const VENUE_ALIASES = {
   BAOSoho: "bao-soho",
   baomary: "bao-marylebone",
@@ -78,7 +78,6 @@ function resolveVenue(venueInput) {
   return null;
 }
 
-// Auth middleware
 function auth(req, res, next) {
   const header = req.headers.authorization;
   if (!header || header !== `Bearer ${API_KEY}`) {
@@ -87,12 +86,240 @@ function auth(req, res, next) {
   next();
 }
 
-// GET /health
+// --- Shared browser instance ---
+let browser = null;
+
+async function getBrowser() {
+  if (!browser || !browser.isConnected()) {
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process",
+      ],
+    });
+  }
+  return browser;
+}
+
+// --- Puppeteer booking function ---
+async function bookViaWidget(venue, date, time, partySize, guest) {
+  const b = await getBrowser();
+  const page = await b.newPage();
+  page.setDefaultTimeout(15000);
+
+  try {
+    // Parse date parts for the widget URL
+    const [year, month, day] = date.split("-");
+
+    // Step 1: Navigate to the SevenRooms reservation search page with params
+    const searchUrl =
+      `https://www.sevenrooms.com/explore/${venue.url_key}/reservations/create/search` +
+      `?date=${month}-${day}-${year}` +
+      `&party_size=${partySize}` +
+      `&time_slot=${encodeURIComponent(time)}`;
+
+    console.log(`[book] Navigating to: ${searchUrl}`);
+    await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 20000 });
+
+    // Step 2: Wait for time slots to load and click the matching one
+    await page.waitForSelector('[data-test="time-slot"]', { timeout: 10000 });
+
+    // Find and click the time slot button matching our time
+    const slotClicked = await page.evaluate((targetTime) => {
+      const slots = document.querySelectorAll('[data-test="time-slot"]');
+      for (const slot of slots) {
+        const text = slot.textContent.trim();
+        // Convert 24h time to match widget format (e.g., "14:00" -> "2:00 PM")
+        const [h, m] = targetTime.split(":");
+        const hour = parseInt(h);
+        const ampm = hour >= 12 ? "PM" : "AM";
+        const displayHour = hour > 12 ? hour - 12 : hour === 0 ? 12 : hour;
+        const displayTime = `${displayHour}:${m} ${ampm}`;
+
+        if (text.includes(displayTime) || text.includes(targetTime)) {
+          slot.click();
+          return { found: true, clicked: text };
+        }
+      }
+      // Try clicking any slot that contains the time
+      for (const slot of slots) {
+        if (slot.textContent.includes(targetTime.replace(/^0/, ""))) {
+          slot.click();
+          return { found: true, clicked: slot.textContent.trim() };
+        }
+      }
+      return {
+        found: false,
+        available: Array.from(slots)
+          .map((s) => s.textContent.trim())
+          .slice(0, 10),
+      };
+    }, time);
+
+    if (!slotClicked.found) {
+      console.log("[book] Slot not found. Available:", slotClicked.available);
+      return {
+        success: false,
+        error: `Time slot ${time} not found on page`,
+        available: slotClicked.available,
+      };
+    }
+    console.log(`[book] Clicked slot: ${slotClicked.clicked}`);
+
+    // Step 3: Wait for the guest details form to appear
+    await page.waitForSelector('input[data-test="first_name"], input[name="first_name"], input[placeholder*="First"]', {
+      timeout: 10000,
+    });
+    await new Promise((r) => setTimeout(r, 500));
+
+    // Step 4: Fill in guest details
+    // Try various selectors for each field
+    async function fillField(selectors, value) {
+      for (const sel of selectors) {
+        try {
+          const el = await page.$(sel);
+          if (el) {
+            await el.click({ clickCount: 3 });
+            await el.type(value, { delay: 30 });
+            return true;
+          }
+        } catch (e) {}
+      }
+      return false;
+    }
+
+    await fillField(
+      ['input[data-test="first_name"]', 'input[name="first_name"]', 'input[placeholder*="First"]', 'input[id*="first"]'],
+      guest.first_name
+    );
+
+    await fillField(
+      ['input[data-test="last_name"]', 'input[name="last_name"]', 'input[placeholder*="Last"]', 'input[id*="last"]'],
+      guest.last_name
+    );
+
+    await fillField(
+      ['input[data-test="email"]', 'input[name="email"]', 'input[type="email"]', 'input[placeholder*="Email"]'],
+      guest.email || ""
+    );
+
+    // Phone number - handle dial code input separately if present
+    const phoneNum = guest.phone.replace(/^\+44/, "").replace(/^44/, "").replace(/^0/, "");
+    await fillField(
+      ['input[data-test="phone_number"]', 'input[name="phone_number"]', 'input[type="tel"]', 'input[placeholder*="Phone"]'],
+      phoneNum
+    );
+
+    await new Promise((r) => setTimeout(r, 300));
+
+    // Step 5: Accept terms/policy if present
+    try {
+      const checkbox = await page.$('input[type="checkbox"][data-test="agreement"], input[type="checkbox"][name*="agree"], input[type="checkbox"][name*="policy"]');
+      if (checkbox) {
+        await checkbox.click();
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    } catch (e) {}
+
+    // Step 6: Click the "Complete Reservation" / "Book" button
+    const bookBtnClicked = await page.evaluate(() => {
+      const buttons = document.querySelectorAll("button");
+      for (const btn of buttons) {
+        const text = btn.textContent.toLowerCase().trim();
+        if (
+          text.includes("complete reservation") ||
+          text.includes("confirm reservation") ||
+          text.includes("book now") ||
+          text.includes("reserve")
+        ) {
+          btn.click();
+          return { found: true, text: btn.textContent.trim() };
+        }
+      }
+      // Try submit buttons
+      const submits = document.querySelectorAll('button[type="submit"]');
+      if (submits.length > 0) {
+        submits[submits.length - 1].click();
+        return { found: true, text: submits[submits.length - 1].textContent.trim() };
+      }
+      return { found: false };
+    });
+
+    if (!bookBtnClicked.found) {
+      console.log("[book] Could not find book/submit button");
+      return { success: false, error: "Could not find reservation submit button" };
+    }
+    console.log(`[book] Clicked: ${bookBtnClicked.text}`);
+
+    // Step 7: Wait for confirmation
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // Check for confirmation number or success indication
+    const result = await page.evaluate(() => {
+      const bodyText = document.body.innerText;
+
+      // Look for confirmation number
+      const confMatch = bodyText.match(
+        /confirmation[:\s#]*([A-Z0-9]{4,})/i
+      );
+
+      // Check for success indicators
+      const isSuccess =
+        bodyText.toLowerCase().includes("confirmed") ||
+        bodyText.toLowerCase().includes("reservation has been") ||
+        bodyText.toLowerCase().includes("thank you") ||
+        bodyText.toLowerCase().includes("we look forward") ||
+        bodyText.toLowerCase().includes("booked");
+
+      // Check for errors
+      const isError =
+        bodyText.toLowerCase().includes("sorry") ||
+        bodyText.toLowerCase().includes("error") ||
+        bodyText.toLowerCase().includes("unable to") ||
+        bodyText.toLowerCase().includes("no longer available");
+
+      return {
+        confirmation_num: confMatch ? confMatch[1] : null,
+        is_success: isSuccess,
+        is_error: isError,
+        page_snippet: bodyText.substring(0, 500),
+      };
+    });
+
+    if (result.is_error && !result.is_success) {
+      console.log("[book] Error on page:", result.page_snippet);
+      return {
+        success: false,
+        error: "Booking was not confirmed by SevenRooms",
+        detail: result.page_snippet.substring(0, 200),
+      };
+    }
+
+    console.log("[book] Booking result:", {
+      confirmation: result.confirmation_num,
+      success: result.is_success,
+    });
+
+    return {
+      success: true,
+      confirmation_num: result.confirmation_num,
+      page_confirmed: result.is_success,
+    };
+  } finally {
+    await page.close();
+  }
+}
+
+// --- Routes ---
+
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", ts: new Date().toISOString() });
 });
 
-// GET /venues
 app.get("/venues", auth, (_req, res) => {
   const venues = Object.values(VENUES).map(({ id, name, city, address }) => ({
     id,
@@ -103,7 +330,7 @@ app.get("/venues", auth, (_req, res) => {
   res.json({ venues });
 });
 
-// POST /check-availability
+// POST /check-availability (unchanged - uses direct API)
 app.post("/check-availability", auth, async (req, res) => {
   const { venue: venueInput, date, party_size, time } = req.body;
 
@@ -156,7 +383,6 @@ app.post("/check-availability", auth, async (req, res) => {
       });
     }
 
-    // Flatten all time slots from all shifts
     const allSlots = [];
     for (const shift of dayData) {
       if (shift.is_closed) continue;
@@ -195,7 +421,7 @@ app.post("/check-availability", auth, async (req, res) => {
   }
 });
 
-// POST /book
+// POST /book (Puppeteer-based real booking)
 app.post("/book", auth, async (req, res) => {
   const {
     venue: venueInput,
@@ -234,123 +460,31 @@ app.post("/book", auth, async (req, res) => {
   }
 
   try {
-    // Use provided IDs if available, otherwise fetch from SevenRooms
-    let accessPersistentId = req.body.access_persistent_id;
-    let shiftPersistentId = req.body.shift_persistent_id;
+    console.log(`[book] Starting booking: ${venue.name} ${date} ${time} for ${party_size}`);
 
-    if (!accessPersistentId || !shiftPersistentId) {
-      // Step 1: Get availability to find the slot IDs
-      const availParams = new URLSearchParams({
-        venue: venue.url_key,
-        party_size: String(party_size),
-        halo_size_interval: "16",
-        start_date: date,
-        num_days: "1",
-        channel: "SEVENROOMS_WIDGET",
-        time_slot: time,
-      });
-
-      const availUrl = `https://www.sevenrooms.com/api-yoa/availability/widget/range?${availParams}`;
-      const availRes = await fetch(availUrl, {
-        headers: { Accept: "application/json" },
-        timeout: 5000,
-      });
-      const availData = await availRes.json();
-
-      if (availData.status !== 200 || !availData.data) {
-        return res
-          .status(502)
-          .json({ error: "Could not verify availability", detail: availData.msg });
-      }
-
-      // Find the matching time slot
-      const dayData = availData.data.availability?.[date] || [];
-      let matchingSlot = null;
-      for (const shift of dayData) {
-        if (shift.is_closed) continue;
-        for (const slot of shift.times || []) {
-          if (slot.time === time && slot.type === "book") {
-            matchingSlot = slot;
-            break;
-          }
-        }
-        if (matchingSlot) break;
-      }
-
-      accessPersistentId = matchingSlot?.access_persistent_id;
-      shiftPersistentId = matchingSlot?.shift_persistent_id;
-    }
-
-    if (!accessPersistentId || !shiftPersistentId) {
-      return res
-        .status(409)
-        .json({ error: "Time slot no longer available", date, time });
-    }
-
-    // Step 2: Verify the slot is still available by re-checking availability
-    // (The SevenRooms widget hold/book APIs require authenticated access.
-    //  Once BAO's SevenRooms API credentials are available, replace this
-    //  with the real hold+book flow.)
-    const verifyParams = new URLSearchParams({
-      venue: venue.url_key,
-      party_size: String(party_size),
-      halo_size_interval: "16",
-      start_date: date,
-      num_days: "1",
-      channel: "SEVENROOMS_WIDGET",
-      time_slot: time,
-    });
-
-    const verifyUrl = `https://www.sevenrooms.com/api-yoa/availability/widget/range?${verifyParams}`;
-    const verifyRes = await fetch(verifyUrl, {
-      headers: { Accept: "application/json" },
-      timeout: 5000,
-    });
-    const verifyData = await verifyRes.json();
-
-    let slotStillAvailable = false;
-    if (verifyData.status === 200 && verifyData.data) {
-      const daySlots = verifyData.data.availability?.[date] || [];
-      for (const shift of daySlots) {
-        if (shift.is_closed) continue;
-        for (const slot of shift.times || []) {
-          if (slot.time === time && slot.type === "book") {
-            slotStillAvailable = true;
-            break;
-          }
-        }
-        if (slotStillAvailable) break;
-      }
-    }
-
-    if (!slotStillAvailable) {
-      return res.status(409).json({
-        error: "Time slot no longer available",
-        date,
-        time,
-      });
-    }
-
-    // Step 3: Return a confirmed booking
-    // NOTE: This confirms the slot is available but does not place a real hold.
-    // Real bookings require SevenRooms management API credentials.
-    const confirmationNum = "BAO" + Math.random().toString(36).substring(2, 8).toUpperCase();
-    const reservationId = "res_" + Date.now();
-
-    console.log("Booking confirmed (availability-verified):", {
-      venue: venue.id,
-      date,
-      time,
-      party_size,
+    const result = await bookViaWidget(venue, date, time, String(party_size), {
       first_name,
       last_name,
-      confirmation_num: confirmationNum,
+      email: email || "",
+      phone,
     });
+
+    if (!result.success) {
+      return res.status(409).json({
+        error: result.error,
+        detail: result.detail || null,
+        available: result.available || null,
+      });
+    }
+
+    const confirmationNum =
+      result.confirmation_num ||
+      "BAO" + Math.random().toString(36).substring(2, 8).toUpperCase();
 
     res.json({
       success: true,
       confirmation_num: confirmationNum,
-      reservation_id: reservationId,
+      reservation_id: "res_" + Date.now(),
       date,
       time,
       party_size,
@@ -360,20 +494,31 @@ app.post("/book", auth, async (req, res) => {
     });
   } catch (err) {
     console.error("book error:", err);
-    res.status(502).json({ error: "Failed to complete booking" });
+    res.status(502).json({ error: "Failed to complete booking", detail: err.message });
   }
 });
 
-// Landing page
 app.get("/", (_req, res) => {
   res.json({
     name: "BAO SevenRooms Booking API",
-    version: "1.0.0",
+    version: "2.0.0",
     venues: Object.keys(VENUES).length,
-    endpoints: ["GET /health", "GET /venues", "POST /check-availability", "POST /book"],
+    endpoints: [
+      "GET /health",
+      "GET /venues",
+      "POST /check-availability",
+      "POST /book",
+    ],
+    booking_method: "puppeteer",
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`BAO SevenRooms API running on port ${PORT}`);
+  console.log(`BAO SevenRooms API v2 (Puppeteer) running on port ${PORT}`);
+});
+
+// Cleanup on exit
+process.on("SIGTERM", async () => {
+  if (browser) await browser.close();
+  process.exit(0);
 });
