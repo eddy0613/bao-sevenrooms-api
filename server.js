@@ -140,8 +140,9 @@ async function bookViaWidget(venue, date, time, partySize, guest) {
     const displayTime = `${h12}:${m} ${ampm}`;
 
     // Step 1: Navigate to the reservation page
+    // Use the direct reservations URL which respects time_slot for shift selection
     const searchUrl =
-      `https://www.sevenrooms.com/explore/${venue.url_key}/reservations/create/search` +
+      `https://www.sevenrooms.com/reservations/${venue.url_key}` +
       `?date=${month}-${day}-${year}` +
       `&party_size=${partySize}` +
       `&time_slot=${encodeURIComponent(time)}`;
