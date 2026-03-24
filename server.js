@@ -150,7 +150,25 @@ async function bookViaWidget(venue, date, time, partySize, guest) {
     await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 25000 });
     await new Promise((r) => setTimeout(r, 4000));
 
-    // Step 2: Find and click the time slot
+    // Step 2a: Click "All Times" to reveal all slots (including lunch)
+    const allTimesClicked = await page.evaluate(() => {
+      // Find elements containing "All Times" text
+      const allEls = document.querySelectorAll("*");
+      for (const el of allEls) {
+        const text = el.textContent.trim();
+        if (text.toLowerCase().includes("all times") && text.length < 50) {
+          // Click this element or its clickable parent
+          const clickable = el.closest("button, a, [role='button'], [role='tab'], div[tabindex]") || el;
+          clickable.click();
+          return { clicked: true, text: clickable.textContent.trim().substring(0, 50) };
+        }
+      }
+      return { clicked: false };
+    });
+    console.log("[book] All Times click:", JSON.stringify(allTimesClicked));
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // Step 2b: Find and click the time slot
     // The widget shows slots grouped by shift. We need to find our time.
     const slotClicked = await page.evaluate((targetTime, displayTime12) => {
       const dt = displayTime12.toLowerCase();
