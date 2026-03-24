@@ -105,16 +105,41 @@ async function getBrowser() {
   return browser;
 }
 
-// --- Hybrid booking: use Puppeteer to get a session, then call APIs directly ---
+// --- Puppeteer booking: intercept network calls while automating the widget ---
 async function bookViaWidget(venue, date, time, partySize, guest) {
   const b = await getBrowser();
   const page = await b.newPage();
   page.setDefaultTimeout(20000);
 
+  // Capture hold/book API responses
+  let holdResponse = null;
+  let bookResponse = null;
+
+  page.on("response", async (response) => {
+    const url = response.url();
+    try {
+      if (url.includes("/availability/widget/hold")) {
+        holdResponse = await response.json();
+        console.log("[intercept] hold response:", JSON.stringify(holdResponse).substring(0, 200));
+      }
+      if (url.includes("/book/widget")) {
+        bookResponse = await response.json();
+        console.log("[intercept] book response:", JSON.stringify(bookResponse).substring(0, 200));
+      }
+    } catch (e) {}
+  });
+
   try {
     const [year, month, day] = date.split("-");
 
-    // Step 1: Navigate to SevenRooms to establish a browser session
+    // Convert 24h time to 12h for URL
+    const h = parseInt(time.split(":")[0]);
+    const m = time.split(":")[1];
+    const ampm = h >= 12 ? "PM" : "AM";
+    const h12 = h > 12 ? h - 12 : h === 0 ? 12 : h;
+    const displayTime = `${h12}:${m} ${ampm}`;
+
+    // Step 1: Navigate to the reservation page
     const searchUrl =
       `https://www.sevenrooms.com/explore/${venue.url_key}/reservations/create/search` +
       `?date=${month}-${day}-${year}` +
@@ -122,181 +147,150 @@ async function bookViaWidget(venue, date, time, partySize, guest) {
       `&time_slot=${encodeURIComponent(time)}`;
 
     console.log(`[book] Navigating to: ${searchUrl}`);
-    await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 20000 });
-    await new Promise((r) => setTimeout(r, 2000));
+    await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 25000 });
+    await new Promise((r) => setTimeout(r, 4000));
 
-    // Step 2: Use the browser session to call hold API directly
-    const holdResult = await page.evaluate(
-      async (venueKey, bookDate, timeSlot, partySz, accessId, shiftId) => {
-        try {
-          const res = await fetch(
-            "https://www.sevenrooms.com/api-yoa/availability/widget/hold",
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                venue: venueKey,
-                date: bookDate,
-                party_size: parseInt(partySz),
-                shift_persistent_id: shiftId,
-                time_slot: timeSlot,
-                access_persistent_id: accessId,
-                halo_size_interval: 16,
-                channel: "SEVENROOMS_WIDGET",
-              }),
-            }
-          );
-          return await res.json();
-        } catch (e) {
-          return { status: 500, msg: e.message };
+    // Step 2: Find and click the time slot
+    // The widget shows slots grouped by shift. We need to find our time.
+    const slotClicked = await page.evaluate((targetTime, displayTime12) => {
+      const dt = displayTime12.toLowerCase();
+      const allEls = document.querySelectorAll("*");
+      const debugTexts = [];
+
+      for (const el of allEls) {
+        // Only check leaf-ish nodes with short text
+        const text = el.textContent.trim();
+        const lcText = text.toLowerCase();
+        if (text.length === 0 || text.length > 50) continue;
+        if (el.querySelectorAll("*").length > 3) continue;
+
+        if (/\d{1,2}:\d{2}/.test(text)) debugTexts.push(text);
+
+        if (lcText.startsWith(targetTime) || lcText.includes(dt)) {
+          const clickTarget = el.closest("button, a, [role='button'], div[tabindex], [class*='slot'], [class*='time']") || el;
+          clickTarget.click();
+          return { found: true, clicked: text };
         }
-      },
-      venue.url_key,
-      date,
-      time,
-      partySize,
-      guest.access_persistent_id || "",
-      guest.shift_persistent_id || ""
-    );
-
-    console.log("[book] Hold result:", JSON.stringify(holdResult));
-
-    if (holdResult.status !== 200) {
-      // If hold fails, try to get fresh IDs from availability first
-      console.log("[book] Hold failed, fetching fresh availability...");
-      const freshResult = await page.evaluate(
-        async (venueKey, bookDate, timeSlot, partySz) => {
-          try {
-            const url = `https://www.sevenrooms.com/api-yoa/availability/widget/range?venue=${venueKey}&party_size=${partySz}&halo_size_interval=16&start_date=${bookDate}&num_days=1&channel=SEVENROOMS_WIDGET&time_slot=${timeSlot}`;
-            const res = await fetch(url);
-            const data = await res.json();
-            if (data.status !== 200) return { error: data.msg };
-
-            const daySlots = data.data?.availability?.[bookDate] || [];
-            for (const shift of daySlots) {
-              if (shift.is_closed) continue;
-              for (const slot of shift.times || []) {
-                if (slot.time === timeSlot && slot.type === "book") {
-                  // Try hold with these fresh IDs
-                  const holdRes = await fetch(
-                    "https://www.sevenrooms.com/api-yoa/availability/widget/hold",
-                    {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({
-                        venue: venueKey,
-                        date: bookDate,
-                        party_size: parseInt(partySz),
-                        shift_persistent_id: slot.shift_persistent_id,
-                        time_slot: timeSlot,
-                        access_persistent_id: slot.access_persistent_id,
-                        halo_size_interval: 16,
-                        channel: "SEVENROOMS_WIDGET",
-                      }),
-                    }
-                  );
-                  const holdData = await holdRes.json();
-                  return {
-                    hold: holdData,
-                    access_persistent_id: slot.access_persistent_id,
-                    shift_persistent_id: slot.shift_persistent_id,
-                  };
-                }
-              }
-            }
-            return { error: "No matching slot found" };
-          } catch (e) {
-            return { error: e.message };
-          }
-        },
-        venue.url_key,
-        date,
-        time,
-        partySize
-      );
-
-      console.log("[book] Fresh hold result:", JSON.stringify(freshResult).substring(0, 300));
-
-      if (freshResult.error || freshResult.hold?.status !== 200) {
-        return {
-          success: false,
-          error: "Could not reserve time slot",
-          detail: freshResult.error || freshResult.hold?.msg,
-        };
       }
 
-      // Use fresh IDs for booking
-      guest.access_persistent_id = freshResult.access_persistent_id;
-      guest.shift_persistent_id = freshResult.shift_persistent_id;
-      holdResult.data = freshResult.hold.data;
-    }
+      return { found: false, available: debugTexts.slice(0, 20) };
+    }, time, displayTime);
 
-    const holdId = holdResult.data?.hold_id;
-    const holdToken = holdResult.data?.token;
-
-    // Step 3: Submit the booking using the browser session
-    const phoneNum = guest.phone.replace(/^\+/, "");
-    const bookResult = await page.evaluate(
-      async (venueKey, bookDate, timeSlot, partySz, guestData, hId, hToken, aId, sId) => {
-        try {
-          const res = await fetch(
-            "https://www.sevenrooms.com/api-yoa/book/widget",
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                venue: venueKey,
-                date: bookDate,
-                time_slot: timeSlot,
-                party_size: parseInt(partySz),
-                first_name: guestData.first_name,
-                last_name: guestData.last_name,
-                email: guestData.email || "",
-                phone_number: guestData.phoneNum,
-                phone_dial_code: "44",
-                phone_country_code: "GB",
-                shift_persistent_id: sId,
-                access_persistent_id: aId,
-                hold_id: hId,
-                token: hToken,
-                halo_size_interval: 16,
-                venue_marketing_opt_in: false,
-                sevenrooms_marketing_opt_in: false,
-                notes: "",
-                channel: "SEVENROOMS_WIDGET",
-              }),
-            }
-          );
-          return await res.json();
-        } catch (e) {
-          return { status: 500, msg: e.message };
-        }
-      },
-      venue.url_key,
-      date,
-      time,
-      partySize,
-      { first_name: guest.first_name, last_name: guest.last_name, email: guest.email, phoneNum },
-      holdId,
-      holdToken,
-      guest.access_persistent_id,
-      guest.shift_persistent_id
-    );
-
-    console.log("[book] Book result:", JSON.stringify(bookResult).substring(0, 300));
-
-    if (bookResult.status !== 200) {
+    if (!slotClicked.found) {
+      console.log("[book] Slot not found. Available on page:", slotClicked.available);
       return {
         success: false,
-        error: "Booking failed",
-        detail: bookResult.msg,
+        error: `Time slot ${time} not found on page`,
+        available: slotClicked.available,
+      };
+    }
+    console.log(`[book] Clicked slot: ${slotClicked.clicked}`);
+
+    // Wait for hold API to fire (triggered by clicking the slot)
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // Step 3: Fill in guest details form
+    await page.waitForFunction(
+      () => document.querySelectorAll("input").length >= 3,
+      { timeout: 10000 }
+    );
+    await new Promise((r) => setTimeout(r, 500));
+
+    // Fill each input field by finding labels or placeholders
+    const inputs = await page.$$("input");
+    for (const input of inputs) {
+      const attrs = await page.evaluate((el) => ({
+        type: el.type,
+        name: el.name || "",
+        placeholder: el.placeholder || "",
+        id: el.id || "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+      }), input);
+
+      const id = (attrs.name + attrs.placeholder + attrs.id + attrs.ariaLabel).toLowerCase();
+
+      if (id.includes("first") && !id.includes("last")) {
+        await input.click({ clickCount: 3 });
+        await input.type(guest.first_name, { delay: 20 });
+      } else if (id.includes("last") || id.includes("surname")) {
+        await input.click({ clickCount: 3 });
+        await input.type(guest.last_name, { delay: 20 });
+      } else if (id.includes("email") || attrs.type === "email") {
+        await input.click({ clickCount: 3 });
+        await input.type(guest.email || "", { delay: 20 });
+      } else if (id.includes("phone") || attrs.type === "tel") {
+        const phoneNum = guest.phone.replace(/^\+44/, "").replace(/^44/, "").replace(/^0/, "");
+        await input.click({ clickCount: 3 });
+        await input.type(phoneNum, { delay: 20 });
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, 500));
+
+    // Step 4: Click "Complete Reservation"
+    const submitClicked = await page.evaluate(() => {
+      const buttons = document.querySelectorAll("button");
+      for (const btn of buttons) {
+        const text = btn.textContent.toLowerCase().trim();
+        if (
+          text.includes("complete reservation") ||
+          text.includes("confirm reservation") ||
+          text.includes("book now") ||
+          text.includes("reserve now") ||
+          (text.includes("reserve") && !text.includes("cancel"))
+        ) {
+          btn.click();
+          return { found: true, text: btn.textContent.trim() };
+        }
+      }
+      const submits = document.querySelectorAll('button[type="submit"]');
+      if (submits.length > 0) {
+        submits[submits.length - 1].click();
+        return { found: true, text: "submit button" };
+      }
+      return { found: false };
+    });
+
+    if (!submitClicked.found) {
+      return { success: false, error: "Could not find submit button" };
+    }
+    console.log(`[book] Clicked submit: ${submitClicked.text}`);
+
+    // Step 5: Wait for the book API response
+    await new Promise((r) => setTimeout(r, 5000));
+
+    // Check the intercepted book response
+    if (bookResponse && bookResponse.status === 200) {
+      return {
+        success: true,
+        confirmation_num: bookResponse.data?.confirmation_number || null,
+        reservation_id: bookResponse.data?.id || null,
+      };
+    }
+
+    // Fallback: check page content for confirmation
+    const pageResult = await page.evaluate(() => {
+      const text = document.body.innerText.toLowerCase();
+      const confirmed =
+        text.includes("confirmed") ||
+        text.includes("thank you") ||
+        text.includes("we look forward") ||
+        text.includes("reservation has been");
+      const confMatch = document.body.innerText.match(/confirmation[:\s#]*([A-Z0-9]{4,})/i);
+      return { confirmed, confirmation_num: confMatch ? confMatch[1] : null };
+    });
+
+    if (pageResult.confirmed) {
+      return {
+        success: true,
+        confirmation_num: pageResult.confirmation_num,
       };
     }
 
     return {
-      success: true,
-      confirmation_num: bookResult.data?.confirmation_number || null,
-      reservation_id: bookResult.data?.id || null,
+      success: false,
+      error: bookResponse?.msg || "Booking not confirmed",
+      detail: bookResponse ? JSON.stringify(bookResponse).substring(0, 200) : null,
     };
   } finally {
     await page.close();
