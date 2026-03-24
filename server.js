@@ -578,6 +578,45 @@ app.post("/book", auth, async (req, res) => {
   }
 });
 
+// Debug endpoint - see what Puppeteer sees on the page
+app.post("/debug-page", auth, async (req, res) => {
+  const { venue: venueInput, date, party_size, time } = req.body;
+  const venue = resolveVenue(venueInput);
+  if (!venue) return res.status(400).json({ error: "Unknown venue" });
+
+  const b = await getBrowser();
+  const page = await b.newPage();
+  try {
+    const [year, month, day] = date.split("-");
+    const searchUrl =
+      `https://www.sevenrooms.com/explore/${venue.url_key}/reservations/create/search` +
+      `?date=${month}-${day}-${year}&party_size=${party_size}&time_slot=${encodeURIComponent(time)}`;
+
+    await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 20000 });
+    await new Promise((r) => setTimeout(r, 4000));
+
+    const debug = await page.evaluate(() => {
+      const allEls = document.querySelectorAll("button, a, [role='button'], div[tabindex], span[tabindex]");
+      const texts = [];
+      for (const el of allEls) {
+        const t = el.textContent.trim();
+        if (t.length > 0 && t.length < 60) texts.push(t);
+      }
+      return {
+        title: document.title,
+        url: window.location.href,
+        buttons: texts,
+        bodySnippet: document.body.innerText.substring(0, 2000),
+      };
+    });
+
+    const screenshot = await page.screenshot({ encoding: "base64", fullPage: true });
+    res.json({ ...debug, screenshot_base64: screenshot.substring(0, 200) + "...(truncated)" });
+  } finally {
+    await page.close();
+  }
+});
+
 app.get("/", (_req, res) => {
   res.json({
     name: "BAO SevenRooms Booking API",
