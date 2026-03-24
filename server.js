@@ -151,23 +151,93 @@ async function bookViaWidget(venue, date, time, partySize, guest) {
     await page.goto(searchUrl, { waitUntil: "networkidle2", timeout: 25000 });
     await new Promise((r) => setTimeout(r, 4000));
 
-    // Step 2a: Click "All Times" to reveal all slots (including lunch)
-    const allTimesClicked = await page.evaluate(() => {
-      // Find elements containing "All Times" text
+    // Step 2a: Click the "All Times" / time selector to change to show all shifts
+    // The header bar shows "2 | 24 Mar | All Times" - we need to click on "All Times" specifically
+    // Then select the right time period from a dropdown/popover
+    const timeFilterClicked = await page.evaluate((targetTime) => {
+      const h = parseInt(targetTime.split(":")[0]);
+      const debugInfo = [];
+
+      // Strategy 1: Find and click an element whose own text (not children) is "All Times" or similar
       const allEls = document.querySelectorAll("*");
       for (const el of allEls) {
-        const text = el.textContent.trim();
-        if (text.toLowerCase().includes("all times") && text.length < 50) {
-          // Click this element or its clickable parent
-          const clickable = el.closest("button, a, [role='button'], [role='tab'], div[tabindex]") || el;
-          clickable.click();
-          return { clicked: true, text: clickable.textContent.trim().substring(0, 50) };
+        // Get only this element's direct text, not children
+        const ownText = Array.from(el.childNodes)
+          .filter((n) => n.nodeType === 3)
+          .map((n) => n.textContent.trim())
+          .join("")
+          .toLowerCase();
+        if (ownText.includes("all times") || ownText === "all times") {
+          el.click();
+          debugInfo.push("clicked own text: " + ownText);
+          return { clicked: true, strategy: "own_text", debug: debugInfo };
         }
       }
-      return { clicked: false };
-    });
-    console.log("[book] All Times click:", JSON.stringify(allTimesClicked));
-    await new Promise((r) => setTimeout(r, 3000));
+
+      // Strategy 2: Look for a dropdown/select for time filtering
+      const selects = document.querySelectorAll("select");
+      for (const sel of selects) {
+        for (const opt of sel.options) {
+          if (opt.text.toLowerCase().includes("all") || opt.text.toLowerCase().includes("lunch")) {
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event("change", { bubbles: true }));
+            debugInfo.push("changed select to: " + opt.text);
+            return { clicked: true, strategy: "select", debug: debugInfo };
+          }
+        }
+      }
+
+      // Strategy 3: Click on the time area in the search bar header, then look for lunch option
+      const headerEls = document.querySelectorAll('[class*="search"], [class*="header"], [class*="filter"], [class*="bar"]');
+      for (const el of headerEls) {
+        const text = el.textContent.toLowerCase();
+        if (text.includes("all times") || text.includes("time")) {
+          // Click nested elements that look like time selectors
+          const children = el.querySelectorAll("button, a, span, div");
+          for (const child of children) {
+            const ct = child.textContent.trim().toLowerCase();
+            if (ct === "all times" || ct.includes("all times")) {
+              child.click();
+              debugInfo.push("clicked header child: " + ct);
+              return { clicked: true, strategy: "header_child", debug: debugInfo };
+            }
+          }
+        }
+      }
+
+      return { clicked: false, debug: debugInfo };
+    }, time);
+    console.log("[book] Time filter click:", JSON.stringify(timeFilterClicked));
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // After clicking the time filter, try to select a lunch-appropriate time from any popover
+    if (timeFilterClicked.clicked) {
+      await page.evaluate((targetTime) => {
+        const h = parseInt(targetTime.split(":")[0]);
+        // Look for time options in a popover/dropdown
+        const options = document.querySelectorAll('[class*="option"], [class*="item"], [class*="dropdown"] *, li, [role="option"]');
+        for (const opt of options) {
+          const text = opt.textContent.trim().toLowerCase();
+          // Click the option closest to our target time
+          if (text.includes(targetTime) || text.includes("lunch") || text.includes("all day") || text.includes("all times")) {
+            opt.click();
+            return true;
+          }
+        }
+        // Also try clicking on a time like "2:00 PM" in the dropdown
+        const ampm = h >= 12 ? "pm" : "am";
+        const h12 = h > 12 ? h - 12 : h;
+        for (const opt of options) {
+          const text = opt.textContent.trim().toLowerCase();
+          if (text.includes(`${h12}:00 ${ampm}`) || text.includes(`${h12}:00${ampm}`)) {
+            opt.click();
+            return true;
+          }
+        }
+        return false;
+      }, time);
+      await new Promise((r) => setTimeout(r, 3000));
+    }
 
     // Step 2b: Find and click the time slot
     // The widget shows slots grouped by shift. We need to find our time.
